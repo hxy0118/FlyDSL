@@ -65,6 +65,7 @@ def _buffer_load_vec(
     elem_bytes,
     offset_in_bytes,
     cache_modifier=0,
+    mask=None,
 ):
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
     from flydsl.expr import arith as _ld_arith
@@ -86,6 +87,7 @@ def _buffer_load_vec(
         vec_width=vec_width,
         dtype=T.i32,
         cache_modifier=cache_modifier,
+        mask=mask,
     )
     if vec_width == 1:
         i32_vec = vector.from_elements(T.vec(1, T.i32), [i32_val])
@@ -542,6 +544,7 @@ def buffer_copy_gmem16_dwordx4(
     rsrc,
     vec_elems: int = 16,
     elem_bytes: int = 1,
+    mask=None,
 ):
     """Copy 16 bytes from global memory into regs via buffer-load dwordx4 lowering."""
     if int(vec_elems) <= 0:
@@ -555,6 +558,7 @@ def buffer_copy_gmem16_dwordx4(
         vec_elems=vec_elems,
         elem_bytes=elem_bytes,
         offset_in_bytes=False,
+        mask=mask,
     )
 
 

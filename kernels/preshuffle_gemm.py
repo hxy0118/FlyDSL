@@ -7,6 +7,7 @@ from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import buffer_ops, const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -394,10 +395,24 @@ def compile_preshuffle_gemm_a8(
         # ---- Buffer resources (runtime byte sizes for OOB protection) ----
         _a_nrec = fx.Int64(c_m * (K * elem_bytes // a_elem_vec_pack))
         _c_nrec = fx.Int64(c_m * c_n * 2)
+        # scale_a is [M] (per-token FP32) for FP8/INT8, [M, K/(32*4)] (FP32) for FP4.
+        # When caller passes actual M < tile_m, scale_a num_records must reflect
+        # c_m so hardware OOB check rejects OOB lanes; without this it falls
+        # back to 0xFFFFFFFF and the buffer_load(mask) 0x7FFFFFFF select still
+        # passes the bounds check. 4 bytes per FP32 row.
+        _scale_a_nrec = fx.Int64(c_m * 4)
         a_rsrc = buffer_ops.create_buffer_resource(arg_a, max_size=False, num_records_bytes=_a_nrec)
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, max_size=False, num_records_bytes=_c_nrec)
         _needs_per_token_scale = not is_f16_or_bf16 and not is_fp4
-        scale_a_rsrc = None if (is_f16_or_bf16) else buffer_ops.create_buffer_resource(arg_scale_a, max_size=False)
+        scale_a_rsrc = (
+            None
+            if (is_f16_or_bf16)
+            else buffer_ops.create_buffer_resource(
+                arg_scale_a,
+                max_size=False,
+                num_records_bytes=_scale_a_nrec if _needs_per_token_scale else None,
+            )
+        )
 
         # ---- Bias buffer resource (for fused epilogue) ----
         # Use max_size=True so the buffer descriptor's size is taken from the
@@ -600,7 +615,7 @@ def compile_preshuffle_gemm_a8(
         c4 = fx.Index(4)
         tx_i32_base = tx * c4
 
-        def load_a_16(idx_elem):
+        def load_a_16(idx_elem, mask=None):
             return buffer_copy_gmem16_dwordx4(
                 buffer_ops,
                 fx.vector,
@@ -609,6 +624,7 @@ def compile_preshuffle_gemm_a8(
                 rsrc=a_rsrc,
                 vec_elems=(16 if elem_bytes == 1 else 8),
                 elem_bytes=elem_bytes,
+                mask=mask,
             )
 
         def a_tile_chunk_coord_i32(i: int):
@@ -620,6 +636,11 @@ def compile_preshuffle_gemm_a8(
                 layout_tile_div4=layout_a_tile_div4,
             )
 
+        # Row-mask: when caller passes actual M < tile_m, OOB rows must
+        # be hardware-rejected (offset → 0x7FFFFFFF) to avoid relying on
+        # whatever PyTorch caching-allocator left after the tensor.
+        c_m_i32 = fx.Int32(c_m)
+
         def load_a_tile(base_k_div4):
             parts = []
             for i in range_constexpr(num_a_loads):
@@ -627,7 +648,9 @@ def compile_preshuffle_gemm_a8(
                 row_a_global = bx_m + row_a_local
                 idx_i32 = row_a_global * _k_div4_factor + (base_k_div4 + col_a_local_i32)
                 idx_elem = idx_i32 if elem_bytes == 1 else idx_i32 * 2
-                a_16B = load_a_16(idx_elem)
+                row_a_global_i32 = fx.Int32(row_a_global)
+                row_valid = fx.arith.cmpi(CmpIPredicate.ult, row_a_global_i32, c_m_i32)
+                a_16B = load_a_16(idx_elem, mask=row_valid)
                 parts.append(Vec(a_16B).bitcast(fx.Int32))
             return parts
 
@@ -820,7 +843,15 @@ def compile_preshuffle_gemm_a8(
                 for mi in range_constexpr(m_repeat):
                     row_base_m = bx_m + (mi * 16)
                     row_g_base = row_base_m + row_off_base
-                    s_a_vec = buffer_ops.buffer_load(scale_a_rsrc, row_g_base, vec_width=4, dtype=fx.Float32)
+                    # Mask: at least first row of the 4-row block must be valid;
+                    # OOB tail dwords within the 16B load are hardware-rejected
+                    # by num_records check (set on scale_a_rsrc with max_size=False
+                    # implies sizeof(arg_scale_a)).
+                    row_g_base_i32 = fx.Int32(row_g_base)
+                    row_g_valid = fx.arith.cmpi(CmpIPredicate.ult, row_g_base_i32, c_m_i32)
+                    s_a_vec = buffer_ops.buffer_load(
+                        scale_a_rsrc, row_g_base, vec_width=4, dtype=fx.Float32, mask=row_g_valid
+                    )
                     scales_pf["s_a_vecs"].append(Vec(s_a_vec))
 
             current_accs_list = list(accs_in)
@@ -1027,13 +1058,20 @@ def compile_preshuffle_gemm_a8(
                     idx_out = row * c_n + col_g0
                     byte_off = idx_out * 2
                     e_vec = 4 if (int(tile_n) % (32 * 4)) == 0 else 2
+                    # Row mask: cshuffle store-side guard for M < tile_m.
+                    row_i32_sp = fx.Int32(row)
+                    row_valid_sp = fx.arith.cmpi(CmpIPredicate.ult, row_i32_sp, c_m_i32)
                     if const_expr(e_vec == 4):
                         frag_i32x2 = Vec(frag).bitcast(fx.Int32)
-                        buffer_ops.buffer_store(frag_i32x2, c_rsrc, byte_off, offset_is_bytes=True)
+                        buffer_ops.buffer_store(
+                            frag_i32x2, c_rsrc, byte_off, offset_is_bytes=True, mask=row_valid_sp
+                        )
                     else:
                         frag_i32x1 = Vec(frag).bitcast(fx.Int32)
                         frag_i32 = frag_i32x1[0]
-                        buffer_ops.buffer_store(frag_i32, c_rsrc, byte_off, offset_is_bytes=True)
+                        buffer_ops.buffer_store(
+                            frag_i32, c_rsrc, byte_off, offset_is_bytes=True, mask=row_valid_sp
+                        )
 
                 e_vec = 4 if (int(tile_n) % (32 * 4)) == 0 else 2
                 mfma_epilog(
@@ -1067,6 +1105,10 @@ def compile_preshuffle_gemm_a8(
                     s_a = Vec(s_a_vec4)[ii]
                 col_base = by_n + n_tile_base + lane_mod_16
                 idx_base = row * c_n + col_base
+                # Row mask: store-side guard for actual M < tile_m; OOB rows
+                # get offset → 0x7FFFFFFF so num_records check rejects.
+                row_i32 = fx.Int32(row)
+                row_valid_store = fx.arith.cmpi(CmpIPredicate.ult, row_i32, c_m_i32)
                 for ni in range_constexpr(num_acc_n):
                     acc_idx = mi * num_acc_n + ni
                     acc = final_accs[acc_idx]
@@ -1155,7 +1197,7 @@ def compile_preshuffle_gemm_a8(
 
                     val_f16 = _out_dtype()(val_s)
                     idx_out = idx_base + (ni * 16)
-                    buffer_ops.buffer_store(val_f16, c_rsrc, idx_out)
+                    buffer_ops.buffer_store(val_f16, c_rsrc, idx_out, mask=row_valid_store)
 
             mfma_epilog(
                 use_cshuffle=False,
