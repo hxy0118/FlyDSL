@@ -129,6 +129,7 @@ def compile_preshuffle_gemm_a8(
     dvmem_preload: int = -1,
     epilogue: str = "none",  # "none", "bias", "bias_relu", "bias_silu", "bias_gelu"
     xcd_swizzle: int = 0,
+    scheduler_mode: int = 0,
 ):
     """Compile the preshuffle GEMM kernel using the @flyc.kernel API.
 
@@ -1183,7 +1184,7 @@ def compile_preshuffle_gemm_a8(
                     prev = cur
                 return out
 
-            if const_expr(_is_gfx942):
+            if const_expr(_is_gfx942 and scheduler_mode == 0):
                 mfma_group = num_acc_n
                 mfma_total = (k_unroll * 2) * m_repeat * mfma_group
                 mfma_per_iter = 2 * mfma_group
@@ -1217,6 +1218,73 @@ def compile_preshuffle_gemm_a8(
                     rocdl.sched_mfma(mfma_group)
                     if const_expr(sche_i >= dswr_start - 1):
                         rocdl.sched_dswr(1)
+            elif const_expr(_is_gfx942 and scheduler_mode == 1):
+                mfma_group = num_acc_n
+                mfma_total = (k_unroll * 2) * m_repeat * mfma_group
+                num_ds_load = num_a_lds_load
+                num_gmem_loads = num_b_loads + (num_a_async_loads if use_async_copy else 0)
+                dswr_tail = num_a_loads if (not use_async_copy) else 0
+                dstr_advance = 2
+                if const_expr(dswr_tail > mfma_total):
+                    dswr_tail = mfma_total
+                _dsrd_pl = min(4, num_ds_load)
+                _dvmem_pl = min(4, num_gmem_loads)
+                vmem_remaining = num_gmem_loads - _dvmem_pl
+                dsrd_remaining = num_ds_load - _dsrd_pl
+                vmem_schedule = _build_scheduler(vmem_remaining, mfma_total)
+                dsrd_schedule = _build_scheduler(dsrd_remaining, mfma_total)
+                dswr_start = max(mfma_total - dswr_tail - dstr_advance, 0)
+                last_dsrd_mfma_idx = -1
+                for sched_idx in range_constexpr(mfma_total):
+                    if const_expr(dsrd_schedule[sched_idx]):
+                        last_dsrd_mfma_idx = sched_idx
+                dswr_start = max(dswr_start, last_dsrd_mfma_idx + 1)
+                if const_expr(_dvmem_pl):
+                    rocdl.sched_vmem(_dvmem_pl)
+                if const_expr(_dsrd_pl):
+                    rocdl.sched_dsrd(_dsrd_pl)
+                idx_ds_write = 0
+                for mfma_idx in range_constexpr(mfma_total):
+                    rocdl.sched_mfma(1)
+                    n_dsrd = dsrd_schedule[mfma_idx]
+                    if const_expr(n_dsrd):
+                        rocdl.sched_dsrd(n_dsrd)
+                    n_vmem = vmem_schedule[mfma_idx]
+                    if const_expr(n_vmem):
+                        rocdl.sched_vmem(n_vmem)
+                    if const_expr((not use_async_copy) and (idx_ds_write < dswr_tail) and (mfma_idx >= dswr_start)):
+                        rocdl.sched_dswr(1)
+                        idx_ds_write += 1
+                if const_expr((not use_async_copy) and (idx_ds_write < num_a_loads)):
+                    rocdl.sched_dswr(num_a_loads - idx_ds_write)
+            elif const_expr(_is_gfx942 and scheduler_mode == 2):
+                mfma_group = num_acc_n
+                mfma_total = (k_unroll * 2) * m_repeat * mfma_group
+                num_ds_load = num_a_lds_load
+                num_gmem_loads = num_b_loads + (num_a_async_loads if use_async_copy else 0)
+                dswr_tail = num_a_loads if (not use_async_copy) else 0
+                _vmem_burst = min(num_gmem_loads, max(4, num_gmem_loads // 2))
+                _dsrd_burst = min(num_ds_load, 4)
+                rocdl.sched_vmem(_vmem_burst)
+                rocdl.sched_dsrd(_dsrd_burst)
+                vmem_rem = num_gmem_loads - _vmem_burst
+                dsrd_rem = num_ds_load - _dsrd_burst
+                idx_ds_write = 0
+                dswr_start = max(mfma_total - dswr_tail - 2, 0)
+                for mfma_idx in range_constexpr(mfma_total):
+                    rocdl.sched_mfma(1)
+                    if const_expr(vmem_rem > 0):
+                        _v = min(2, vmem_rem)
+                        rocdl.sched_vmem(_v)
+                        vmem_rem -= _v
+                    if const_expr(dsrd_rem > 0):
+                        rocdl.sched_dsrd(1)
+                        dsrd_rem -= 1
+                    if const_expr((not use_async_copy) and (idx_ds_write < dswr_tail) and (mfma_idx >= dswr_start)):
+                        rocdl.sched_dswr(1)
+                        idx_ds_write += 1
+                if const_expr((not use_async_copy) and (idx_ds_write < num_a_loads)):
+                    rocdl.sched_dswr(num_a_loads - idx_ds_write)
             else:
                 mfma_group = num_acc_n
                 if const_expr(use_mfma_k32):
