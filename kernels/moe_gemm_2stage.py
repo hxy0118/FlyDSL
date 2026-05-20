@@ -236,9 +236,6 @@ def compile_moe_gemm1(
     if use_cshuffle_epilog is None:
         use_cshuffle_epilog = os.environ.get("FLYDSL_MOE_STAGE1_CSHUFFLE", "1") in ("1", "true", "True", "YES", "yes")
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
-    # Split-K uses f32 atomic CShuffle regardless of out_dtype, so skip this check.
-    if out_dtype != "f16" and use_cshuffle_epilog and not _is_splitk:
-        raise ValueError("stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')")
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
@@ -383,8 +380,8 @@ def compile_moe_gemm1(
                 )
                 lds_x = lds_x_ptr.get()
                 # Alias LDS bytes for optional CShuffle epilogue.
-                # Split-K uses f32 (4B) per element for atomic accumulation; normal uses f16 (2B).
-                _lds_out_elem_type = T.f32 if _is_splitk else T.f16
+                # Split-K uses f32 (4B) per element; f16/bf16 both use 2B.
+                _lds_out_elem_type = T.f32 if _is_splitk else out_mlir()
                 lds_out = (
                     SmemPtr(base_ptr, lds_x_ptr.byte_offset, _lds_out_elem_type, shape=(tile_m * tile_n,)).get()
                     if _use_cshuffle_epilog
@@ -1482,10 +1479,10 @@ def compile_moe_gemm1(
                             y = silu(vg) * vu
                             if const_expr(doweight_stage1):
                                 y = y * tw
-                            y16 = arith.trunc_f(T.f16, y)
+                            y_out = arith.trunc_f(out_mlir(), y)
 
                             lds_idx = row_base_lds + col_local
-                            v1 = vector.from_elements(T.vec(1, T.f16), [y16])
+                            v1 = vector.from_elements(T.vec(1, out_mlir()), [y_out])
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                     def precompute_row(*, row_local, row):
@@ -1527,6 +1524,7 @@ def compile_moe_gemm1(
                         by_n=by_n,
                         n_tile_base=n_tile_base,
                         lds_out=lds_out,
+                        frag_elem_type=out_mlir(),
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
